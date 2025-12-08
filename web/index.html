@@ -111,57 +111,32 @@
   </style>
 </head>
 <body>
-  <header style="width:100%; max-width:1200px;">
-    <div class="row" style="justify-content:space-between; align-items:flex-start;">
-      <div>
-        <h1>BMW Screener ➜ Voice Interview</h1>
-        <p>Single-session flow: Typeform screening, qualification, and an ElevenLabs interview with resume + transcript.</p>
-      </div>
-      <div class="status">
-        <span class="pill" id="state-pill">Pending</span>
-        <span id="state-detail">No session yet</span>
-      </div>
+  <header style="width:100%; max-width:960px;">
+    <h1>BMW Screener ➜ Voice Interview</h1>
+    <p>Answer the screener below, then start the brief voice interview. We'll handle the rest.</p>
+    <div class="status">
+      <span class="pill" id="state-pill">Pending</span>
+      <span id="state-detail">Setting up…</span>
     </div>
   </header>
 
-  <div class="grid">
+  <div class="grid" style="max-width:960px;">
     <div class="panel">
-      <div class="tag">Session</div>
-      <p id="session-id" class="mono">…</p>
-      <div class="row">
-        <button id="new-session">Start / Resume Session</button>
-        <button id="fresh-session">New Session</button>
-        <button id="copy-id">Copy ID</button>
-      </div>
-      <div class="divider"></div>
-      <div class="tag">Manual resume</div>
-      <div class="row">
-        <input id="resume-input" placeholder="Paste respondent_id to resume" />
-        <button id="resume-btn">Resume</button>
-      </div>
-      <p style="margin-top:10px;">We persist the respondent ID in localStorage so drop-offs can continue later.</p>
+      <div class="tag">Step 1 · Screener</div>
+      <p>Complete the short survey. Your unique link keeps your progress.</p>
+      <iframe id="tf-frame" title="Typeform Screener" allow="microphone; camera; autoplay" style="background:#ffffff;"></iframe>
     </div>
 
     <div class="panel">
-      <div class="tag">Screening (Typeform)</div>
-      <p>Hidden param <code>respondent_id</code> is injected into the embed. Webhook updates the backend when complete.</p>
-      <iframe id="tf-frame" title="Typeform Screener" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
-      <p style="margin-top:8px;">Update <code>TYPEFORM_FORM_ID</code> below to your form.</p>
-    </div>
-
-    <div class="panel">
-      <div class="tag">Interview</div>
+      <div class="tag">Step 2 · Voice Interview</div>
       <p id="segment-label">Waiting for qualification…</p>
       <div class="row">
-        <button id="start-interview" disabled>Start / Resume Interview</button>
-        <button id="mark-complete" disabled>Mark Complete</button>
+        <button id="start-interview" disabled>Start Interview</button>
       </div>
       <p id="interview-status" class="mono" style="margin-top:10px;">No conversation yet.</p>
       <div class="divider"></div>
-      <p class="tag">Progress</p>
-      <ul id="question-list"></ul>
-      <p class="tag">Transcript (placeholder)</p>
-      <p class="mono" id="transcript-log">Streaming audio/text would render here. Wire ElevenLabs client.</p>
+      <p class="tag">Transcript</p>
+      <p class="mono" id="transcript-log">You’ll see the conversation here once the interview starts.</p>
     </div>
   </div>
 
@@ -171,28 +146,21 @@
 
     const statePill = document.getElementById("state-pill");
     const stateDetail = document.getElementById("state-detail");
-    const sessionIdEl = document.getElementById("session-id");
     const tfFrame = document.getElementById("tf-frame");
     const startBtn = document.getElementById("start-interview");
-    const completeBtn = document.getElementById("mark-complete");
     const interviewStatus = document.getElementById("interview-status");
     const segmentLabel = document.getElementById("segment-label");
-    const questionList = document.getElementById("question-list");
     const transcriptLog = document.getElementById("transcript-log");
 
-    const resumeInput = document.getElementById("resume-input");
-    const resumeBtn = document.getElementById("resume-btn");
-    const newSessionBtn = document.getElementById("new-session");
-    const freshSessionBtn = document.getElementById("fresh-session");
-    const copyBtn = document.getElementById("copy-id");
-
-    let respondentId = localStorage.getItem("respondent_id") || "";
+    const getQueryParam = (key) => new URLSearchParams(window.location.search).get(key);
+    let respondentId = getQueryParam("respondent_id") || getQueryParam("user_id") || localStorage.getItem("respondent_id") || "";
     let lastSession = null;
     let micStream = null;
     let audioCtx = null;
     let processor = null;
     let ws = null;
     let wsUrl = "";
+    let sessionContext = {};
     let pollTimer = null;
     let sendAudioAsJson = true; // ElevenLabs ConvAI expects JSON messages with base64 audio
     let outputFormat = "pcm_16000";
@@ -204,13 +172,24 @@
       statePill.style.background = color;
     };
 
+    let typeformReadyPromise = null;
     const setTypeformSrc = (id) => {
+      if (!tfFrame) return;
       if (!TYPEFORM_FORM_ID || TYPEFORM_FORM_ID === "YOUR_FORM_ID") {
         tfFrame.srcdoc = "<div style='padding:24px;color:#e5e7eb;font-family:Space Grotesk;'>Set TYPEFORM_FORM_ID in web/index.html to load your screener.</div>";
         return;
       }
       const base = `https://form.typeform.com/to/${TYPEFORM_FORM_ID}`;
-      tfFrame.src = `${base}?respondent_id=${encodeURIComponent(id)}`;
+      const url = `${base}?typeform-embed=embed-widget&respondent_id=${encodeURIComponent(id)}`;
+      tfFrame.removeAttribute("srcdoc");
+      tfFrame.src = url;
+    };
+
+    const updateUrlWithId = () => {
+      if (!respondentId) return;
+      const url = new URL(window.location.href);
+      url.searchParams.set("respondent_id", respondentId);
+      window.history.replaceState({}, "", url.toString());
     };
 
     async function createOrResume(id) {
@@ -223,6 +202,7 @@
       lastSession = data.state;
       hydrateUI();
       setTypeformSrc(respondentId);
+      updateUrlWithId();
       startSessionPolling();
     }
 
@@ -236,7 +216,6 @@
 
     function hydrateUI() {
       if (!respondentId) return;
-      sessionIdEl.textContent = respondentId;
       const status = lastSession?.status || "pending_screening";
       stateDetail.textContent = status;
       if (status === "interview_complete") setPill("Complete", "#22c55e");
@@ -247,7 +226,6 @@
       const segment = lastSession?.segment;
       segmentLabel.textContent = segment ? `Segment: ${segment}` : "Waiting for qualification…";
       startBtn.disabled = !(segment && status !== "interview_complete");
-      completeBtn.disabled = status !== "interview_in_progress";
       interviewStatus.textContent = lastSession?.conversation_id
         ? `Conversation: ${lastSession.conversation_id}`
         : "No conversation yet.";
@@ -278,50 +256,23 @@
       }
       const data = await res.json();
       wsUrl = data.ws_url;
+      sessionContext = data.context || {};
       lastSession = { ...(lastSession || {}), conversation_id: data.conversation_id, segment: data.segment, progress: data.progress };
       hydrateUI();
-      renderQuestions(data.questions);
       transcriptLog.textContent = "Connecting to ElevenLabs…";
       await connectVoice();
     }
 
-    function renderQuestions(questions = []) {
-      questionList.innerHTML = "";
-      questions.forEach((q, idx) => {
-        const li = document.createElement("li");
-        li.textContent = `${idx + 1}. ${q}`;
-        questionList.appendChild(li);
-      });
-    }
-
-    async function markComplete() {
-      if (!respondentId) return;
-      const transcript = [{ system: "demo", message: "Interview completed." }];
-      const res = await fetch(`${API_BASE}/api/conversation/complete`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ respondent_id: respondentId, transcript }),
-      });
-      if (res.ok) {
-        await refreshSession();
-      }
-    }
-
-    newSessionBtn.onclick = () => createOrResume(respondentId).catch(err => alert(err));
-    document.getElementById("fresh-session").onclick = () => {
-      respondentId = "";
-      localStorage.removeItem("respondent_id");
-      createOrResume("").catch(err => alert(err));
-    };
-    resumeBtn.onclick = () => createOrResume(resumeInput.value.trim()).catch(err => alert(err));
-    copyBtn.onclick = () => navigator.clipboard.writeText(respondentId || "");
     startBtn.onclick = () => startConversation();
-    completeBtn.onclick = () => markComplete();
 
     // init
-    if (respondentId) {
-      createOrResume(respondentId).catch(() => {});
-    }
+    (async () => {
+      if (respondentId) {
+        await createOrResume(respondentId).catch(() => {});
+      } else {
+        await createOrResume("").catch(() => {});
+      }
+    })();
 
     function startSessionPolling() {
       clearSessionPolling();
@@ -387,7 +338,11 @@
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const initMsg = {
         type: "conversation_initiation_client_data",
-        dynamic_variables: { respondent_id: respondentId },
+        dynamic_variables: {
+          respondent_id: respondentId,
+          segment: sessionContext.segment || lastSession?.segment,
+          screening_summary: sessionContext.summary,
+        },
       };
       ws.send(JSON.stringify(initMsg));
     }

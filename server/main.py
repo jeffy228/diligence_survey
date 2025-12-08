@@ -13,11 +13,14 @@ from typing import Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv, find_dotenv
+import logging
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
+WEB_DIR = ROOT / "web"
 SESSION_STORE = ROOT / os.getenv("SESSION_STORE_PATH", "data/sessions.json")
 TRANSCRIPT_DIR = ROOT / os.getenv("TRANSCRIPT_STORE_PATH", "data/transcripts")
 
@@ -28,6 +31,10 @@ load_dotenv(find_dotenv())
 for env in ENV_FILES:
     if env.exists():
         load_dotenv(env, override=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("diligence")
+logger.setLevel(logging.INFO)
 
 TYPEFORM_FORM_ID = os.getenv("TYPEFORM_FORM_ID", "")
 TYPEFORM_WEBHOOK_SECRET = os.getenv("TYPEFORM_WEBHOOK_SECRET", "")
@@ -45,6 +52,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Serve the static frontend under /interview
+if WEB_DIR.exists():
+    app.mount("/interview", StaticFiles(directory=WEB_DIR, html=True), name="interview")
 
 
 # --------- storage helpers ---------
@@ -119,9 +129,9 @@ def _segment_from_answers(answers: List[dict]) -> str:
     return SEGMENT_SCREENED_OUT
 
 
-def _new_session() -> dict:
+def _new_session(respondent_id: Optional[str] = None) -> dict:
     return {
-        "respondent_id": str(uuid.uuid4()),
+        "respondent_id": respondent_id or str(uuid.uuid4()),
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
         "segment": None,
@@ -130,6 +140,40 @@ def _new_session() -> dict:
         "conversation_id": None,
         "progress": {"asked": 0, "answered": 0},
     }
+
+
+def _extract_answers(form_response: Optional[dict]) -> Dict[str, Any]:
+    answers = form_response.get("answers") if isinstance(form_response, dict) else []
+    result: Dict[str, Any] = {}
+    for ans in answers or []:
+        qid = ans.get("field", {}).get("id") or ans.get("field", {}).get("ref")
+        if ans.get("type") == "choice":
+            result[qid] = ans.get("choice", {}).get("label")
+        elif ans.get("type") == "choices":
+            result[qid] = ans.get("choices", {}).get("labels")
+        elif ans.get("type") == "text":
+            result[qid] = ans.get("text")
+    return result
+
+
+def _session_context(session: dict) -> Dict[str, Any]:
+    """Build a lightweight context blob to share with ElevenLabs."""
+    answers = _extract_answers(session.get("typeform_response"))
+    brands = answers.get("brand") or answers.get("car_brand")
+    context = {
+        "segment": session.get("segment"),
+        "status": session.get("status"),
+        "answers": answers,
+    }
+    # Add a readable summary for the prompt
+    parts = []
+    if session.get("segment"):
+        parts.append(f"Segment: {session['segment']}")
+    if brands:
+        parts.append(f"Brands: {brands}")
+    summary = "; ".join(parts) or "No screening summary available."
+    context["summary"] = summary
+    return context
 
 
 def _update_session(respondent_id: str, **kwargs) -> dict:
@@ -157,8 +201,7 @@ def create_or_resume_session(respondent_id: Optional[str] = None) -> SessionCrea
         sessions = _load_sessions()
         if respondent_id in sessions:
             return SessionCreateResponse(respondent_id=respondent_id, state=sessions[respondent_id])
-    session = _new_session()
-    # avoid passing respondent_id twice
+    session = _new_session(respondent_id)
     session_copy = {k: v for k, v in session.items() if k != "respondent_id"}
     _update_session(session["respondent_id"], **session_copy)
     return SessionCreateResponse(respondent_id=session["respondent_id"], state=session)
@@ -268,6 +311,11 @@ async def start_conversation(req: ConversationStartRequest):
             f"{ws_base}/v1/convai/conversation?"
             f"agent_id={ELEVENLABS_AGENT_ID}&conversation_id={conversation_id}&xi-api-key={ELEVENLABS_API_KEY}"
         )
+    context = _session_context(session)
+    try:
+        logger.info("ElevenLabs context for %s: %s", req.respondent_id, json.dumps(context))
+    except Exception:
+        logger.info("ElevenLabs context for %s: %s", req.respondent_id, context)
 
     return {
         "conversation_id": conversation_id,
@@ -276,6 +324,7 @@ async def start_conversation(req: ConversationStartRequest):
         "progress": session.get("progress", {}),
         "history": session.get("history", []),
         "ws_url": ws_url,
+        "context": context,
     }
 
 
