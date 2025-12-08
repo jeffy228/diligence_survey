@@ -1,0 +1,6 @@
+data/sessions.json
+data/transcripts/
+server/.venv/
+__pycache__/
+.DS_Store
+.env
