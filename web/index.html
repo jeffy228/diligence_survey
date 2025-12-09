@@ -465,30 +465,36 @@
 // }
 
     function sendConvAIInit() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const c = sessionContext || {};
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const c = sessionContext || {};
 
-  // 1. Transform your local history format (role: 'agent'/'you', message: '...')
-  //    to the standard LLM API format (role: 'assistant'/'user', content: '...')
-    const historyPayload = conversationHistory.map(h => ({
-      // Map 'agent' to 'assistant' and 'you' to 'user'
-      role: h.role === 'agent' ? 'assistant' : 'user',
-      content: h.message
-    }));
+      // Map local history to assistant/user roles
+      const historyPayload = conversationHistory.map((h) => ({
+        role: h.role === "agent" ? "assistant" : "user",
+        content: h.message,
+      }));
 
-    const initMsg = {
-      type: "conversation_initiation_client_data",
-      dynamic_variables: {
-        respondent_id: respondentId,
-        segment: c.segment || lastSession?.segment,
-        summary: c.summary || "",
-        user_id: respondentId,
-      },
-      conversation_history: historyPayload,
-    };
-  
-  ws.send(JSON.stringify(initMsg));
-}
+      // Optional resumption message for the agent
+      let resumptionMsg = "";
+      if (historyPayload.length) {
+        const lastEntry = conversationHistory[conversationHistory.length - 1];
+        resumptionMsg = `We were last discussing: ${lastEntry.message?.slice(0, 120) || ""}`;
+      }
+
+      const initMsg = {
+        type: "conversation_initiation_client_data",
+        dynamic_variables: {
+          respondent_id: respondentId,
+          user_id: respondentId,
+          segment: c.segment || lastSession?.segment,
+          summary: c.summary || "",
+          resumption_message: resumptionMsg,
+        },
+        conversation_history: historyPayload,
+      };
+
+      ws.send(JSON.stringify(initMsg));
+    }
 
     function sendEndSignal() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
