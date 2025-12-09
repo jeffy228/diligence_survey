@@ -132,6 +132,7 @@
       <p id="segment-label">Waiting for qualification…</p>
       <div class="row">
         <button id="start-interview" disabled>Start Interview</button>
+        <button id="pause-interview" disabled>Pause Interview</button>  <button id="end-interview" disabled>Complete Interview</button>
       </div>
       <p id="interview-status" class="mono" style="margin-top:10px;">No conversation yet.</p>
       <div class="divider"></div>
@@ -148,6 +149,8 @@
     const stateDetail = document.getElementById("state-detail");
     const tfFrame = document.getElementById("tf-frame");
     const startBtn = document.getElementById("start-interview");
+    const endBtn = document.getElementById("end-interview");
+    const pauseBtn = document.getElementById("pause-interview");
     const interviewStatus = document.getElementById("interview-status");
     const segmentLabel = document.getElementById("segment-label");
     const transcriptLog = document.getElementById("transcript-log");
@@ -166,6 +169,8 @@
     let outputFormat = "pcm_16000";
     let audioQueue = [];
     let isPlayingAudio = false;
+    let interviewEnded = false;
+    let conversationHistory = [];
 
     const setPill = (text, color) => {
       statePill.textContent = text;
@@ -175,6 +180,21 @@
     let typeformReadyPromise = null;
     const setTypeformSrc = (id) => {
       if (!tfFrame) return;
+      if (["screened_out", "qualified", "interview_in_progress", "interview_complete"].includes(lastSession?.status)) {
+        tfFrame.srcdoc = `
+          <div style="padding:32px; font-family:Space Grotesk, sans-serif; color:#e5e7eb; background:#0f172a; min-height:520px; display:flex; align-items:center; justify-content:center; text-align:center; border-radius:12px;">
+            <div>
+              <p style="margin:0 0 8px; font-size:18px; font-weight:600;">Survey not available</p>
+              <p style="margin:0; color:#cbd5f5;">${
+                lastSession?.status === "screened_out"
+                  ? "You did not qualify for this survey. Thanks for your time."
+                  : "You’ve already completed screening. Please continue to the interview."
+              }</p>
+            </div>
+          </div>`;
+        tfFrame.removeAttribute("src");
+        return;
+      }
       if (!TYPEFORM_FORM_ID || TYPEFORM_FORM_ID === "YOUR_FORM_ID") {
         tfFrame.srcdoc = "<div style='padding:24px;color:#e5e7eb;font-family:Space Grotesk;'>Set TYPEFORM_FORM_ID in web/index.html to load your screener.</div>";
         return;
@@ -226,12 +246,18 @@
       const segment = lastSession?.segment;
       segmentLabel.textContent = segment ? `Segment: ${segment}` : "Waiting for qualification…";
       startBtn.disabled = !(segment && status !== "interview_complete");
+      const isInProgress = status === "interview_in_progress";
+      pauseBtn.disabled = !isInProgress;
+      endBtn.disabled = !isInProgress;
+      // pauseBtn.disabled = !isInProgress;
+      // endBtn.disabled = !(status === "interview_in_progress");
       interviewStatus.textContent = lastSession?.conversation_id
         ? `Conversation: ${lastSession.conversation_id}`
         : "No conversation yet.";
 
-      if (lastSession?.history) {
-        transcriptLog.textContent = JSON.stringify(lastSession.history, null, 2);
+      if (lastSession?.history && lastSession.history.length) {
+        conversationHistory = lastSession.history;
+        transcriptLog.textContent = conversationHistory.map(h => `${h.role}: ${h.message}`).join("\n");
       }
 
       // keep polling until interview is complete so webhook updates are picked up automatically
@@ -247,7 +273,7 @@
       const res = await fetch(`${API_BASE}/api/conversation/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ respondent_id: respondentId }),
+        body: JSON.stringify({ respondent_id: respondentId, transcript: conversationHistory }),
       });
       if (!res.ok) {
         const err = await res.text();
@@ -258,12 +284,59 @@
       wsUrl = data.ws_url;
       sessionContext = data.context || {};
       lastSession = { ...(lastSession || {}), conversation_id: data.conversation_id, segment: data.segment, progress: data.progress };
+      interviewEnded = false;
+      if (lastSession?.history?.length) {
+        conversationHistory = lastSession.history;
+      } else {
+        conversationHistory = [];
+      }
       hydrateUI();
       transcriptLog.textContent = "Connecting to ElevenLabs…";
       await connectVoice();
     }
 
+    async function pauseInterview() {
+  interviewEnded = true;
+  sendEndSignal();
+  cleanupVoice();
+  if (respondentId) {
+    try {
+      // Call the new backend /pause endpoint to set status to 'qualified'
+      await fetch(`${API_BASE}/api/conversation/pause`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ respondent_id: respondentId }),
+      });
+      await refreshSession(); // Fetches new status ('qualified') to re-enable 'Start' button
+    } catch (err) {
+      console.error("pauseInterview error", err);
+    }
+  }
+  transcriptLog.textContent = (transcriptLog.textContent || "") + "\n[Interview paused]";
+}
+
+    async function endInterview() {
+      interviewEnded = true;
+      sendEndSignal();
+      cleanupVoice();
+      if (respondentId) {
+        try {
+          await fetch(`${API_BASE}/api/conversation/complete`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ respondent_id: respondentId, transcript: conversationHistory }),
+          });
+          await refreshSession();
+        } catch (err) {
+          console.error("endInterview error", err);
+        }
+      }
+      transcriptLog.textContent = (transcriptLog.textContent || "") + "\n[Interview ended]";
+    }
+
     startBtn.onclick = () => startConversation();
+    pauseBtn.onclick = () => pauseInterview();
+    endBtn.onclick = () => endInterview();
 
     // init
     (async () => {
@@ -334,17 +407,95 @@
       };
     }
 
+    // need to pass upon creation of websocket
+
+    // when websocket open, the interview's already begun
+
+    // function sendConvAIInit() {
+    //   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    //   const c = sessionContext || {};
+    //   const initMsg = {
+    //     type: "conversation_initiation_client_data",
+    //     dynamic_variables: {
+    //       respondent_id: respondentId,
+    //       segment: c.segment || lastSession?.segment,
+    //       summary: c.summary || "",
+    //     },
+    //   };
+    //   ws.send(JSON.stringify(initMsg));
+    // }
+
+
+//     function sendConvAIInit() {
+//   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+//   const c = sessionContext || {};
+  
+//   // 1. Transform your local history format (role: 'agent'/'you', message: '...')
+//   const historyPayload = conversationHistory.map(h => ({
+//     role: h.role === 'agent' ? 'assistant' : 'user',
+//     content: h.message
+//   }));
+  
+//   // 2. Determine if this is a resumption and create an acknowledgement message
+//   let resumptionMsg = "";
+//   if (historyPayload.length > 0) {
+//     // Get the last message to summarize where they left off
+//     const lastEntry = conversationHistory[conversationHistory.length - 1];
+    
+//     // Create the message the agent will acknowledge in its first turn
+//     resumptionMsg = `It looks like we were just discussing: ${lastEntry.message.substring(0, 80)}...`;
+//   }
+
+//   const initMsg = {
+//     type: "conversation_initiation_client_data",
+//     dynamic_variables: {
+//       respondent_id: respondentId,
+//       segment: c.segment || lastSession?.segment,
+//       summary: c.summary || "",
+//       // ⭐ NEW: Pass the acknowledgement message ⭐
+//       // resumption_message: resumptionMsg, 
+//     },
+//     // 3. CRITICAL: Pass the full, structured history in the dedicated field.
+//     // This is required for the LLM's memory/context window, even if the dynamic variable 
+//     // is used to trigger the verbal acknowledgement.
+//     conversation_history: historyPayload, 
+//   };
+  
+//   ws.send(JSON.stringify(initMsg));
+// }
+
     function sendConvAIInit() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const c = sessionContext || {};
+
+  // 1. Transform your local history format (role: 'agent'/'you', message: '...')
+  //    to the standard LLM API format (role: 'assistant'/'user', content: '...')
+    const historyPayload = conversationHistory.map(h => ({
+      // Map 'agent' to 'assistant' and 'you' to 'user'
+      role: h.role === 'agent' ? 'assistant' : 'user',
+      content: h.message
+    }));
+
+    const initMsg = {
+      type: "conversation_initiation_client_data",
+      dynamic_variables: {
+        respondent_id: respondentId,
+        segment: c.segment || lastSession?.segment,
+        summary: c.summary || "",
+        user_id: respondentId,
+      },
+      conversation_history: historyPayload,
+    };
+  
+  ws.send(JSON.stringify(initMsg));
+}
+
+    function sendEndSignal() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const initMsg = {
-        type: "conversation_initiation_client_data",
-        dynamic_variables: {
-          respondent_id: respondentId,
-          segment: sessionContext.segment || lastSession?.segment,
-          screening_summary: sessionContext.summary,
-        },
-      };
-      ws.send(JSON.stringify(initMsg));
+      ws.send(JSON.stringify({ type: "client_message", message: "Interview complete. You can end the call." }));
+      try {
+        ws.close();
+      } catch (_) {}
     }
 
     function handleConvAIMessage(msg) {
@@ -363,6 +514,23 @@
       }
       if (msg.type === "ping") {
         ws?.send(JSON.stringify({ type: "pong", event_id: msg.ping_event?.event_id }));
+      }
+    }
+
+
+    function appendTranscript(role, text) {
+      const existing = transcriptLog.textContent || "";
+      const line = `${role}: ${text}`;
+      transcriptLog.textContent = existing ? `${existing}\n${line}` : line;
+      conversationHistory.push({ role, message: text });
+
+      // Auto-save the conversation history every time the transcript updates (agent turns)
+      if (role === "agent" && respondentId) {
+        fetch(`${API_BASE}/api/conversation/autosave`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ respondent_id: respondentId, transcript: conversationHistory }),
+        }).catch(err => console.error("Auto-save failed:", err));
       }
     }
 
@@ -482,6 +650,16 @@
       const existing = transcriptLog.textContent || "";
       const line = `${role}: ${text}`;
       transcriptLog.textContent = existing ? `${existing}\n${line}` : line;
+      conversationHistory.push({ role, message: text });
+
+      // Auto-save after agent turns to persist progress
+      if (role === "agent" && respondentId) {
+        fetch(`${API_BASE}/api/conversation/autosave`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ respondent_id: respondentId, transcript: conversationHistory }),
+        }).catch((err) => console.error("Auto-save failed:", err));
+      }
     }
 
     function floatTo16BitPCM(float32Array) {

@@ -78,6 +78,16 @@ def _load_sessions() -> Dict[str, dict]:
         return {}
 
 
+def _load_transcript(respondent_id: str) -> List[dict]:
+    transcript_path = TRANSCRIPT_DIR / f"{respondent_id}.json"
+    if transcript_path.exists():
+        try:
+            return json.loads(transcript_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
 def _save_sessions(sessions: Dict[str, dict]) -> None:
     _ensure_dirs()
     SESSION_STORE.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
@@ -92,9 +102,14 @@ class SessionCreateResponse(BaseModel):
 
 class ConversationStartRequest(BaseModel):
     respondent_id: str
+    transcript: Optional[List[dict]] = None
 
 
 class ConversationCompleteRequest(BaseModel):
+    respondent_id: str
+    transcript: List[dict]
+
+class ConversationAutosaveRequest(BaseModel):
     respondent_id: str
     transcript: List[dict]
 
@@ -159,18 +174,30 @@ def _extract_answers(form_response: Optional[dict]) -> Dict[str, Any]:
 def _session_context(session: dict) -> Dict[str, Any]:
     """Build a lightweight context blob to share with ElevenLabs."""
     answers = _extract_answers(session.get("typeform_response"))
-    brands = answers.get("brand") or answers.get("car_brand")
+    brands = answers.get("brand") or answers.get("car_brand") or answers.get("9EawtpVz2FRz")
+    age = answers.get("lrD5CjElTTnT") or answers.get("age")
+    income = answers.get("Xy1wudYMt9pj") or answers.get("income")
+    name = answers.get("jlgabpgsjzjV") or answers.get("name")
     context = {
         "segment": session.get("segment"),
         "status": session.get("status"),
         "answers": answers,
+        "answers_brands": brands or "",
+        "answers_age": age or "",
+        "answers_income": income or "",
     }
     # Add a readable summary for the prompt
     parts = []
+    if name:
+        parts.append(f"Name: {name}")
     if session.get("segment"):
         parts.append(f"Segment: {session['segment']}")
     if brands:
         parts.append(f"Brands: {brands}")
+    if age:
+        parts.append(f"Age: {age}")
+    if income:
+        parts.append(f"Income: {income}")
     summary = "; ".join(parts) or "No screening summary available."
     context["summary"] = summary
     return context
@@ -257,6 +284,7 @@ async def handle_typeform_webhook(request: Request):
     )
     return {}
 
+# main.py
 
 @app.post("/api/conversation/start")
 async def start_conversation(req: ConversationStartRequest):
@@ -267,34 +295,53 @@ async def start_conversation(req: ConversationStartRequest):
         raise HTTPException(status_code=400, detail="screening not complete")
 
     conversation_id = session.get("conversation_id") or str(uuid.uuid4())
+    
+    # 1. FETCH AND FORMAT HISTORY FOR ELEVENLABS API
+    existing_history = session.get("history", [])
+    history_payload = []
+    for entry in existing_history:
+        # Map your stored roles ('agent'/'you') to the LLM's expected roles ('assistant'/'user')
+        role = "assistant" if entry.get("role") == "agent" else "user"
+        history_payload.append({"role": role, "content": entry.get("message", "")})
+    
     # Create/ensure ElevenLabs conversation exists
     if not ELEVENLABS_API_KEY or not ELEVENLABS_AGENT_ID:
         raise HTTPException(status_code=500, detail="ElevenLabs credentials not configured")
 
+    context = _session_context(session)
     ws_url_override = None
-    try:
+
+    async def _create_conv(url: str) -> Optional[dict]:
         async with httpx.AsyncClient(timeout=10) as client:
+            
+            # 2. Build the request body, including history and user_id (respondent_id)
+            request_body = {
+                "agent_id": ELEVENLABS_AGENT_ID,
+                "conversation_id": conversation_id,
+                "user_id": req.respondent_id,  # <-- YOUR EXISTING AND CORRECT USER ID PASSING
+                "dynamic_variables": context,
+            }
+            # CRITICAL FIX: Inject the conversation history only if it exists
+            if history_payload:
+                request_body["conversation_history"] = history_payload 
+
             resp = await client.post(
-                f"{ELEVENLABS_BASE_URL}/v1/convai/conversations",
+                url,
                 headers={"xi-api-key": ELEVENLABS_API_KEY},
-                json={
-                    "agent_id": ELEVENLABS_AGENT_ID,
-                    "conversation_id": conversation_id,
-                    "user_id": req.respondent_id,
-                },
+                json=request_body, # Use the combined body
             )
             resp.raise_for_status()
-            data = resp.json()
-            ws_url_override = data.get("websocket_url") or data.get("ws_url")
+            return resp.json()
+
+    try:
+        conv_payload = await _create_conv(f"{ELEVENLABS_BASE_URL}/v1/convai/conversations")
+        ws_url_override = conv_payload.get("websocket_url") or conv_payload.get("ws_url")
     except httpx.HTTPStatusError as exc:
-        # Some accounts/agents may not require or allow the create call (405). If so, proceed anyway.
         status_code = exc.response.status_code if exc.response is not None else 500
-        if status_code == 405:
-            pass
-        else:
-            detail = exc.response.text if exc.response is not None else str(exc)
+        detail = exc.response.text if exc.response is not None else str(exc)
+        if status_code != 405:
             raise HTTPException(status_code=status_code, detail=detail)
-    except Exception as exc:  # pragma: no cover - external service
+    except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=str(exc))
 
     session = _update_session(
@@ -311,11 +358,125 @@ async def start_conversation(req: ConversationStartRequest):
             f"{ws_base}/v1/convai/conversation?"
             f"agent_id={ELEVENLABS_AGENT_ID}&conversation_id={conversation_id}&xi-api-key={ELEVENLABS_API_KEY}"
         )
-    context = _session_context(session)
+
+    return {
+        "conversation_id": conversation_id,
+        "segment": session["segment"],
+        "questions": questions,
+        "progress": session.get("progress", {}),
+        "history": existing_history,
+        "ws_url": ws_url,
+        "context": context,
+    }
+
+
+# @app.post("/api/conversation/start")
+# async def start_conversation(req: ConversationStartRequest):
+#     session = _get_session(req.respondent_id)
+#     if session.get("status") == "screened_out":
+#         raise HTTPException(status_code=400, detail="respondent did not qualify")
+#     if not session.get("segment"):
+#         raise HTTPException(status_code=400, detail="screening not complete")
+
+#     conversation_id = session.get("conversation_id") or str(uuid.uuid4())
+#     # Create/ensure ElevenLabs conversation exists
+#     if not ELEVENLABS_API_KEY or not ELEVENLABS_AGENT_ID:
+#         raise HTTPException(status_code=500, detail="ElevenLabs credentials not configured")
+
+#     ws_url_override = None
+
+#     # 1. Get the existing history from request, session, or transcript file
+#     if req.transcript:
+#         existing_history = req.transcript
+#     else:
+#         existing_history = session.get("history", [])
+#         if not existing_history:
+#             existing_history = _load_transcript(req.respondent_id)
+#             if existing_history:
+#                 session = _update_session(
+#                     req.respondent_id,
+#                     history=existing_history,
+#                     progress={"asked": len(existing_history), "answered": len(existing_history)},
+#                 )
+
+#     # 2. Convert the history format for the ElevenLabs API (role: agent/you -> assistant/user)
+#     history_payload = []
+#     history_text_parts = []
+#     for entry in existing_history:
+#         role = "assistant" if entry.get("role") == "agent" else "user"
+#         content = entry.get("message", "")
+#         history_payload.append({"role": role, "content": content})
+#         history_text_parts.append(f"{role}: {content}")
+
+#     # 3. Build context (after history loaded)
+#     context = _session_context(session)
+#     context["user_id"] = req.respondent_id
+#     if history_text_parts:
+#         context["history_text"] = "\n".join(history_text_parts)
+
+    async def _create_conv(url: str) -> Optional[dict]:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # 3. Build the request body, including history_payload
+            request_body = {
+                "agent_id": ELEVENLABS_AGENT_ID,
+                "conversation_id": conversation_id,
+                "user_id": req.respondent_id,
+                "dynamic_variables": context,
+            }
+            # Only include history if it exists
+            if history_payload:
+                request_body["conversation_history"] = history_payload # <--- ⭐ CRITICAL FIX ⭐
+
+            resp = await client.post(
+                url,
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                json=request_body, # <--- Use the combined body
+            )
+            # ... (rest of the function is the same)
+
+    # async def _create_conv(url: str) -> Optional[dict]:
+    #     async with httpx.AsyncClient(timeout=10) as client:
+    #         resp = await client.post(
+    #             url,
+    #             headers={"xi-api-key": ELEVENLABS_API_KEY},
+    #             json={
+    #                 "agent_id": ELEVENLABS_AGENT_ID,
+    #                 "conversation_id": conversation_id,
+    #                 "user_id": req.respondent_id,
+    #                 "dynamic_variables": context,
+    #             },
+    #         )
+            resp.raise_for_status()
+            return resp.json()
+
     try:
-        logger.info("ElevenLabs context for %s: %s", req.respondent_id, json.dumps(context))
-    except Exception:
-        logger.info("ElevenLabs context for %s: %s", req.respondent_id, context)
+        conv_payload = await _create_conv(f"{ELEVENLABS_BASE_URL}/v1/convai/conversations")
+        ws_url_override = conv_payload.get("websocket_url") or conv_payload.get("ws_url")
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 500
+        detail = exc.response.text if exc.response is not None else str(exc)
+        if status_code != 405:
+            raise HTTPException(status_code=status_code, detail=detail)
+        # ignore 405 and fall back to direct WS URL
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    session = _update_session(
+        req.respondent_id,
+        conversation_id=conversation_id,
+        status="interview_in_progress",
+        history=existing_history,
+        progress={"asked": len(existing_history), "answered": len(existing_history)},
+    )
+    questions = _question_set_for_segment(session["segment"])
+    ws_base = ELEVENLABS_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+    if ws_url_override:
+        ws_url = ws_url_override
+    else:
+        ws_url = (
+            f"{ws_base}/v1/convai/conversation?"
+            f"agent_id={ELEVENLABS_AGENT_ID}&conversation_id={conversation_id}&xi-api-key={ELEVENLABS_API_KEY}"
+        )
 
     return {
         "conversation_id": conversation_id,
@@ -374,6 +535,60 @@ async def complete_conversation(req: ConversationCompleteRequest):
         status="interview_complete",
         progress={"asked": len(req.transcript), "answered": len(req.transcript)},
         history=req.transcript,
+    )
+    return {}
+
+
+@app.post("/api/conversation/autosave", status_code=204)
+async def autosave_conversation(req: ConversationAutosaveRequest):
+    """Persist partial transcript without ending the interview."""
+    session = _get_session(req.respondent_id)
+    if not session.get("conversation_id"):
+        raise HTTPException(status_code=400, detail="conversation not started")
+
+    transcript_path = TRANSCRIPT_DIR / f"{req.respondent_id}.json"
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    transcript_path.write_text(json.dumps(req.transcript, indent=2), encoding="utf-8")
+
+    _update_session(
+        req.respondent_id,
+        status="interview_in_progress",
+        progress={"asked": len(req.transcript), "answered": len(req.transcript)},
+        history=req.transcript,
+    )
+    return {}
+
+
+class ConversationAutosaveRequest(BaseModel):
+    respondent_id: str
+    transcript: List[dict]
+
+@app.post("/api/conversation/autosave", status_code=204)
+async def autosave_conversation(req: ConversationAutosaveRequest):
+    """Saves the current conversation transcript without ending the interview."""
+    session = _get_session(req.respondent_id)
+
+    # Only save if the interview is currently in progress
+    if session.get("status") == "interview_in_progress":
+        _update_session(
+            req.respondent_id,
+            history=req.transcript,
+            progress={"asked": len(req.transcript), "answered": len(req.transcript)},
+        )
+    return {}
+
+
+@app.post("/api/conversation/pause", status_code=204)
+async def pause_conversation(req: ConversationStartRequest):
+    """Saves current state and sets status to 'qualified' to enable resumption."""
+    session = _get_session(req.respondent_id)
+    if session.get("status") != "interview_in_progress":
+        raise HTTPException(status_code=400, detail="interview is not in progress")
+
+    # The history is handled by the autosave endpoint. We only update the status.
+    _update_session(
+        req.respondent_id,
+        status="qualified",  # Sets the state back to qualified, enabling the 'Start' button
     )
     return {}
 
